@@ -4,68 +4,76 @@ import torch
 import wikipedia
 from sentence_transformers import SentenceTransformer, util
 
-# Load model and tokenizer
-model_path = "./models/distilbert_model"
-model = DistilBertForSequenceClassification.from_pretrained(model_path)
-tokenizer = DistilBertTokenizerFast.from_pretrained(model_path)
+tokenizer = DistilBertTokenizerFast.from_pretrained("./models/distilbert_model")
+model = DistilBertForSequenceClassification.from_pretrained("./models/distilbert_model")
+
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 model.to(device)
 model.eval()
 
-def classify_and_explain(text):
-    inputs = tokenizer(
-        text,
-        return_tensors="pt",
-        truncation=True,
-        padding="max_length",
-        max_length=128
-    ).to(device)
+def get_wikipedia_summary(text):
+    try:
+        page = wikipedia.page(text, auto_suggest=False)
+        return page.summary, page.url
+    except Exception:
+        try:
+            search_results = wikipedia.search(text)
+            if search_results:
+                page = wikipedia.page(search_results[0])
+                return page.summary, page.url
+        except Exception:
+            pass
+    return "", ""
 
+def predict(text):
+    # Encode input
+    inputs = tokenizer(text, truncation=True, padding=True, return_tensors="pt").to(device)
     with torch.no_grad():
-        logits = model(**inputs).logits
-        prediction = torch.argmax(logits, dim=1).item()
-        label = "Real" if prediction == 0 else "Fake"
+        outputs = model(**inputs)
+        logits = outputs.logits
+        probabilities = torch.softmax(logits, dim=1)
+        pred_label = torch.argmax(probabilities, dim=1).item()
+        pred_prob = probabilities[0][pred_label].item()
 
-    # Wikipedia retrieval
-    try:
-        summary = wikipedia.summary(text, sentences=2)
-        wiki_page = wikipedia.page(text)
-        wiki_link = wiki_page.url
-    except Exception:
-        summary = "No related Wikipedia content found."
-        wiki_link = ""
+    # Retrieve Wikipedia summary
+    wiki_summary, wiki_url = get_wikipedia_summary(text)
 
-    # Semantic similarity
-    try:
-        claim_emb = embedder.encode(text, convert_to_tensor=True)
-        summary_emb = embedder.encode(summary, convert_to_tensor=True)
-        sim_score = util.pytorch_cos_sim(claim_emb, summary_emb).item()
-        sim_text = f"Semantic Similarity: {sim_score:.2f}"
-    except Exception:
-        sim_text = "Semantic similarity unavailable."
+    if wiki_summary:
+        query_embedding = embedder.encode(text, convert_to_tensor=True)
+        wiki_embedding = embedder.encode(wiki_summary, convert_to_tensor=True)
+        similarity = util.cos_sim(query_embedding, wiki_embedding).item()
+    else:
+        similarity = 0.0
 
-    label_color = "green" if label == "Real" else "red"
-    output_label = f"<span style='color:{label_color}; font-weight:bold'>{label}</span>"
+    # Decision logic with semantic fallback
+    if similarity > 0.6:
+        label = "Real"
+        confidence = similarity
+    else:
+        label = "Fake" if pred_label == 1 else "Real"
+        confidence = pred_prob
 
-    wiki_html = (
-        f"<p>{summary}</p><p><a href='{wiki_link}' target='_blank'>Read more</a></p>"
-        if wiki_link else f"<p>{summary}</p>"
-    )
+    return {
+        "Prediction": f"{label} ({confidence:.2f})",
+        "Wikipedia Summary": wiki_summary or "No summary found.",
+        "Wikipedia Link": wiki_url or "N/A",
+        "Semantic Similarity Score": f"{similarity:.2f}"
+    }
 
-    return output_label, wiki_html, sim_text
-
-iface = gr.Interface(
-    fn=classify_and_explain,
-    inputs=gr.Textbox(label="Enter News Statement"),
+interface = gr.Interface(
+    fn=predict,
+    inputs=gr.Textbox(lines=3, placeholder="Enter a news claim here..."),
     outputs=[
-        gr.HTML(label="Prediction"),
-        gr.HTML(label="Wikipedia Summary"),
-        gr.Textbox(label="Semantic Similarity")
+        gr.Textbox(label="Prediction"),
+        gr.Textbox(label="Wikipedia Summary"),
+        gr.Textbox(label="Wikipedia Link"),
+        gr.Textbox(label="Semantic Similarity Score")
     ],
-    title="TruthLens - Fake News Detector",
-    description="Enter a claim to classify it and get supporting Wikipedia content.",
+    title="TruthLens - Fake News Detection and Verification",
+    description="This tool predicts whether a claim is likely Real or Fake and retrieves related Wikipedia content."
 )
 
-iface.launch()
+if __name__ == "__main__":
+    interface.launch()
